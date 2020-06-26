@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	// Bucket names we perform transactions in
+	// key prefixes to denote buckets
 	dbLogs = []byte("logs")
 	dbConf = []byte("conf")
 
@@ -54,13 +54,13 @@ func (b *BadgerStore) Close() error {
 
 // FirstIndex returns the first known index from the Raft log.
 func (b *BadgerStore) FirstIndex() (uint64, error) {
-	tx, err := b.conn.NewTransaction(false)
-	if err != nil {
-		return 0, err
-	}
+	tx := b.conn.NewTransaction(false)
 	defer tx.Discard()
 
-	iterator := tx.Get(dbLogs)
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.Prefix = dbLogs
+
+	iterator := tx.NewIterator(itOpts)
 	defer iterator.Close()
 
 	// check if the iterator is empty
@@ -78,45 +78,65 @@ func (b *BadgerStore) FirstIndex() (uint64, error) {
 			return nil
 		})
 	}
-
-	if first, _ := curs.First(); first == nil {
-		return 0, nil
-	} else {
-		return bytesToUint64(first), nil
-	}
+	return ret, nil
 }
 
 // LastIndex returns the last known index from the Raft log.
 func (b *BadgerStore) LastIndex() (uint64, error) {
-	tx, err := b.conn.Begin(false)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
+	tx := b.conn.NewTransaction(false)
+	defer tx.Discard()
 
-	curs := tx.Bucket(dbLogs).Cursor()
-	if last, _ := curs.Last(); last == nil {
-		return 0, nil
-	} else {
-		return bytesToUint64(last), nil
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.Prefix = dbLogs
+
+	iterator := tx.NewIterator(itOpts)
+	defer iterator.Close()
+
+	var ret uint64
+	for {
+		if !iterator.Valid() {
+			break
+		}
+
+		if item := iterator.Item(); item != nil {
+			// get the value thru an anonymous function without incurring
+			// copy cost
+			item.Value(func(val []byte) error {
+				ret = bytesToUint64(val)
+				return nil
+			})
+		}
+
+		iterator.Next()
 	}
+	return ret, nil
 }
 
 // GetLog is used to retrieve a log from BadgerDB at a given index.
 func (b *BadgerStore) GetLog(idx uint64, log *raft.Log) error {
-	tx, err := b.conn.Begin(false)
+	tx := b.conn.NewTransaction(false)
+	defer tx.Discard()
+
+	// simulate boltdb "buckets" with key prefixes
+	// dbLogs is the prefix of the log keys
+	item, err := tx.Get(append(dbLogs, uint64ToBytes(idx)...))
+
 	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return raft.ErrLogNotFound
+		}
 		return err
 	}
-	defer tx.Rollback()
 
-	bucket := tx.Bucket(dbLogs)
-	val := bucket.Get(uint64ToBytes(idx))
-
-	if val == nil {
+	if item == nil {
 		return raft.ErrLogNotFound
 	}
-	return decodeMsgPack(val, log)
+
+	item.Value(func(val []byte) error {
+		decodeMsgPack(val, log)
+		return nil
+	})
+	return nil
 }
 
 // StoreLog is used to store a single raft log
@@ -126,20 +146,23 @@ func (b *BadgerStore) StoreLog(log *raft.Log) error {
 
 // StoreLogs is used to store a set of raft logs
 func (b *BadgerStore) StoreLogs(logs []*raft.Log) error {
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	tx := b.conn.NewTransaction(true)
+	defer tx.Discard()
 
 	for _, log := range logs {
-		key := uint64ToBytes(log.Index)
+		// once again, simulate boltdb "buckets" with key prefixes
+		// dbLogs is the prefix of the log keys
+		key := append(dbLogs, uint64ToBytes(log.Index)...)
+
 		val, err := encodeMsgPack(log)
 		if err != nil {
 			return err
 		}
-		bucket := tx.Bucket(dbLogs)
-		if err := bucket.Put(key, val.Bytes()); err != nil {
+
+		// it is not allowed to re-use key and value in the same
+		// transcation. however we seem to be allocating new slices
+		// so...
+		if err := tx.Set(key, val.Bytes()); err != nil {
 			return err
 		}
 	}
@@ -151,23 +174,35 @@ func (b *BadgerStore) StoreLogs(logs []*raft.Log) error {
 func (b *BadgerStore) DeleteRange(min, max uint64) error {
 	minKey := uint64ToBytes(min)
 
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	tx := b.conn.NewTransaction(true)
+	defer tx.Discard()
 
-	curs := tx.Bucket(dbLogs).Cursor()
-	for k, _ := curs.Seek(minKey); k != nil; k, _ = curs.Next() {
-		// Handle out-of-range log index
-		if bytesToUint64(k) > max {
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.Prefix = dbLogs
+
+	iterator := tx.NewIterator(itOpts)
+	defer iterator.Close()
+
+	// deal with the minKey first
+	iterator.Seek(minKey)
+	for {
+		if !iterator.Valid() {
 			break
 		}
 
-		// Delete in-range log index
-		if err := curs.Delete(); err != nil {
-			return err
+		if item := iterator.Item(); item != nil {
+			// Delete in-range log index
+			k := item.Key()
+
+			if bytesToUint64(k) > max {
+				break
+			}
+			if err := tx.Delete(k); err != nil {
+				return err
+			}
 		}
+
+		iterator.Next()
 	}
 
 	return tx.Commit()
@@ -175,14 +210,10 @@ func (b *BadgerStore) DeleteRange(min, max uint64) error {
 
 // Set is used to set a key/value set outside of the raft log
 func (b *BadgerStore) Set(k, v []byte) error {
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	tx := b.conn.NewTransaction(true)
+	defer tx.Discard()
 
-	bucket := tx.Bucket(dbConf)
-	if err := bucket.Put(k, v); err != nil {
+	if err := tx.Set(append(dbConf, k...), v); err != nil {
 		return err
 	}
 
@@ -191,19 +222,22 @@ func (b *BadgerStore) Set(k, v []byte) error {
 
 // Get is used to retrieve a value from the k/v store by key
 func (b *BadgerStore) Get(k []byte) ([]byte, error) {
-	tx, err := b.conn.Begin(false)
+	tx := b.conn.NewTransaction(false)
+	defer tx.Discard()
+
+	item, err := tx.Get(append(dbConf, k...));
 	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, raft.ErrLogNotFound
+		}
 		return nil, err
 	}
-	defer tx.Rollback()
 
-	bucket := tx.Bucket(dbConf)
-	val := bucket.Get(k)
-
-	if val == nil {
+	if item == nil {
 		return nil, ErrKeyNotFound
 	}
-	return append([]byte(nil), val...), nil
+
+	return item.ValueCopy(nil)
 }
 
 // SetUint64 is like Set, but handles uint64 values

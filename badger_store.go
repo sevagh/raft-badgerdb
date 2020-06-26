@@ -225,7 +225,7 @@ func (b *BadgerStore) Get(k []byte) ([]byte, error) {
 	tx := b.conn.NewTransaction(false)
 	defer tx.Discard()
 
-	item, err := tx.Get(append(dbConf, k...));
+	item, err := tx.Get(append(dbConf, k...))
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil, raft.ErrLogNotFound

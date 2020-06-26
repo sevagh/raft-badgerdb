@@ -2,11 +2,11 @@ package raftbadgerdb
 
 import (
 	"bytes"
+	"errors"
 	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
-	"time"
 
 	badger "github.com/dgraph-io/badger/v2"
 	"github.com/hashicorp/raft"
@@ -45,40 +45,6 @@ func TestBadgerStore_Implements(t *testing.T) {
 	}
 }
 
-func TestBadgerOptionsTimeout(t *testing.T) {
-	fh, err := ioutil.TempFile("", "badger")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	os.Remove(fh.Name())
-	defer os.Remove(fh.Name())
-	options := Options{
-		Path: fh.Name(),
-		BadgerOptions: &badger.Options{
-			Timeout: time.Second / 10,
-		},
-	}
-	store, err := New(options)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer store.Close()
-	// trying to open it again should timeout
-	doneCh := make(chan error, 1)
-	go func() {
-		_, err := New(options)
-		doneCh <- err
-	}()
-	select {
-	case err := <-doneCh:
-		if err == nil || err.Error() != "timeout" {
-			t.Errorf("Expected timeout error but got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Errorf("Gave up waiting for timeout response")
-	}
-}
-
 func TestBadgerOptionsReadOnly(t *testing.T) {
 	fh, err := ioutil.TempFile("", "badger")
 	if err != nil {
@@ -100,13 +66,9 @@ func TestBadgerOptionsReadOnly(t *testing.T) {
 	}
 
 	store.Close()
-	options := Options{
-		Path: fh.Name(),
-		BadgerOptions: &badger.Options{
-			Timeout:  time.Second / 10,
-			ReadOnly: true,
-		},
-	}
+	options := badger.DefaultOptions(fh.Name())
+	options.ReadOnly = true
+
 	roStore, err := New(options)
 	if err != nil {
 		t.Fatalf("err: %s", err)
@@ -123,8 +85,8 @@ func TestBadgerOptionsReadOnly(t *testing.T) {
 	}
 	// Attempt to store the log, should fail on a read-only store
 	err = roStore.StoreLog(log)
-	if err != badger.ErrDatabaseReadOnly {
-		t.Errorf("expecting error %v, but got %v", badger.ErrDatabaseReadOnly, err)
+	if !errors.Is(err, badger.ErrReadOnlyTxn) {
+		t.Errorf("expecting error %v, but got %v", badger.ErrReadOnlyTxn, err)
 	}
 }
 
@@ -150,25 +112,9 @@ func TestNewBadgerStore(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	// Close the store so we can open again
+	// Close the store
 	if err := store.Close(); err != nil {
 		t.Fatalf("err: %s", err)
-	}
-
-	// Ensure our tables were created
-	db, err := badger.Open(fh.Name(), dbFileMode, nil)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	tx, err := db.Begin(true)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if _, err := tx.CreateBucket([]byte(dbLogs)); err != badger.ErrBucketExists {
-		t.Fatalf("bad: %v", err)
-	}
-	if _, err := tx.CreateBucket([]byte(dbConf)); err != badger.ErrBucketExists {
-		t.Fatalf("bad: %v", err)
 	}
 }
 

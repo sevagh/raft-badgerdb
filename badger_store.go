@@ -1,6 +1,7 @@
 package raftbadgerdb
 
 import (
+	"bytes"
 	"errors"
 
 	badger "github.com/dgraph-io/badger/v2"
@@ -52,64 +53,48 @@ func (b *BadgerStore) Close() error {
 	return b.conn.Close()
 }
 
-// FirstIndex returns the first known index from the Raft log.
 func (b *BadgerStore) FirstIndex() (uint64, error) {
-	tx := b.conn.NewTransaction(false)
-	defer tx.Discard()
-
-	itOpts := badger.DefaultIteratorOptions
-	itOpts.Prefix = dbLogs
-
-	iterator := tx.NewIterator(itOpts)
-	defer iterator.Close()
-
-	// check if the iterator is empty
-	if !iterator.Valid() {
-		return 0, nil
-	}
-
 	var ret uint64
 
-	// get the value thru an anonymous function without incurring
-	// copy cost
-	if firstItem := iterator.Item(); firstItem != nil {
-		firstItem.Value(func(val []byte) error {
-			ret = bytesToUint64(val)
-			return nil
-		})
-	}
-	return ret, nil
+	err := b.conn.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+
+		prefix := dbLogs
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			k := item.Key()
+			ret = bytesToUint64(bytes.TrimPrefix(k, dbLogs))
+			break
+		}
+		return nil
+	})
+	return ret, err
 }
 
 // LastIndex returns the last known index from the Raft log.
 func (b *BadgerStore) LastIndex() (uint64, error) {
-	tx := b.conn.NewTransaction(false)
-	defer tx.Discard()
-
-	itOpts := badger.DefaultIteratorOptions
-	itOpts.Prefix = dbLogs
-
-	iterator := tx.NewIterator(itOpts)
-	defer iterator.Close()
-
 	var ret uint64
-	for {
-		if !iterator.Valid() {
-			break
-		}
 
-		if item := iterator.Item(); item != nil {
-			// get the value thru an anonymous function without incurring
-			// copy cost
-			item.Value(func(val []byte) error {
-				ret = bytesToUint64(val)
-				return nil
-			})
-		}
+	err := b.conn.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Reverse = true
 
-		iterator.Next()
-	}
-	return ret, nil
+		prefix := dbLogs
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		it.Rewind()
+		if it.ValidForPrefix(prefix) {
+			k := it.Item().Key()
+			ret = bytesToUint64(bytes.TrimPrefix(k, dbLogs))
+			return nil
+		}
+		return nil
+	})
+	return ret, err
 }
 
 // GetLog is used to retrieve a log from BadgerDB at a given index.
@@ -128,7 +113,7 @@ func (b *BadgerStore) GetLog(idx uint64, log *raft.Log) error {
 		return err
 	}
 
-	if item == nil {
+	if item == nil || item.IsDeletedOrExpired() {
 		return raft.ErrLogNotFound
 	}
 
@@ -190,14 +175,15 @@ func (b *BadgerStore) DeleteRange(min, max uint64) error {
 			break
 		}
 
-		if item := iterator.Item(); item != nil {
+		if item := iterator.Item(); item != nil && !item.IsDeletedOrExpired() {
 			// Delete in-range log index
-			k := item.Key()
+			origKey := item.Key()
+			k := bytes.TrimPrefix(origKey, dbLogs)
 
 			if bytesToUint64(k) > max {
 				break
 			}
-			if err := tx.Delete(k); err != nil {
+			if err := tx.Delete(origKey); err != nil {
 				return err
 			}
 		}
@@ -205,6 +191,7 @@ func (b *BadgerStore) DeleteRange(min, max uint64) error {
 		iterator.Next()
 	}
 
+	iterator.Close()
 	return tx.Commit()
 }
 
@@ -228,12 +215,12 @@ func (b *BadgerStore) Get(k []byte) ([]byte, error) {
 	item, err := tx.Get(append(dbConf, k...))
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
-			return nil, raft.ErrLogNotFound
+			return nil, ErrKeyNotFound
 		}
 		return nil, err
 	}
 
-	if item == nil {
+	if item == nil || item.IsDeletedOrExpired() {
 		return nil, ErrKeyNotFound
 	}
 

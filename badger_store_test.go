@@ -13,14 +13,14 @@ import (
 )
 
 func testBadgerStore(t testing.TB) *BadgerStore {
-	fh, err := ioutil.TempFile("", "badger")
+	tempdir, err := ioutil.TempDir("", "badger")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	os.Remove(fh.Name())
+	os.Remove(tempdir)
 
 	// Successfully creates and returns a store
-	store, err := NewBadgerStore(fh.Name())
+	store, err := NewBadgerStore(tempdir)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -46,12 +46,12 @@ func TestBadgerStore_Implements(t *testing.T) {
 }
 
 func TestBadgerOptionsReadOnly(t *testing.T) {
-	fh, err := ioutil.TempFile("", "badger")
+	tempdir, err := ioutil.TempDir("", "badger")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	defer os.Remove(fh.Name())
-	store, err := NewBadgerStore(fh.Name())
+	defer os.Remove(tempdir)
+	store, err := NewBadgerStore(tempdir)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -66,7 +66,7 @@ func TestBadgerOptionsReadOnly(t *testing.T) {
 	}
 
 	store.Close()
-	options := badger.DefaultOptions(fh.Name())
+	options := badger.DefaultOptions(tempdir)
 	options.ReadOnly = true
 
 	roStore, err := New(options)

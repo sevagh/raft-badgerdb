@@ -30,7 +30,9 @@ type BadgerStore struct {
 
 // NewBadgerStore takes a file path and returns a connected Raft backend.
 func NewBadgerStore(path string) (*BadgerStore, error) {
-	return New(badger.DefaultOptions(path))
+	opts := badger.DefaultOptions(path)
+	opts.Logger = nil
+	return New(opts)
 }
 
 // New uses the supplied options to open the BadgerDB and prepare it for use as a raft backend.
